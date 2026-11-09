@@ -87,7 +87,7 @@ window.VOICES = {
    "Behind schedule. {partner} believed in you. That was {his} first mistake!",
    "Slipping? And you haven't even hit the hard part yet!",
    "Behind already? It gets so much harder!",
-   "Falling behind is your natural state. Give in to it.",
+   "Arkansas is the Natural State. Lagging behind is your natural state.",
    "Behind plan, behind everyone. Story of your life!",
    "Slow as shit! I'm lovin' it!",
    "You knew this is how it was going to be, right?",
