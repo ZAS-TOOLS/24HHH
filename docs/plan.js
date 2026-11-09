@@ -22,9 +22,18 @@
   const FORMATS = {
     24: { label: '24-hour', startHour: 10, dur: 24, laps: { full: 70, golden: 100, qualify: 100 }, trad: { golden: 55, qualify: 55 }, pts: { golden: 12000, qualify: 12000 }, zones: 24, ft: 5280, hourBonus: 790,
       checkins: [{ at: 21.5, end: 22.5, label: 'Check-in (9:30–10:30 pm window)' }, { at: 27.5, end: 28.5, label: 'Check-in, eyeballs (3:30–4:30 am window)' }] },
+    // Training: any length, starts whenever you press GO; no comp-only goals, check-ins or hour bonus
+    T: { label: 'Training', startHour: 0, dur: 3, laps: { full: Infinity, golden: Infinity, qualify: Infinity }, trad: { golden: Infinity, qualify: Infinity }, pts: { golden: Infinity, qualify: Infinity }, zones: 24, ft: null, hourBonus: 0, checkins: [], training: true },
     12: { label: '12-hour', startHour: 7.5, dur: 12, laps: { full: 40, golden: 65, qualify: 65 }, trad: { golden: 40, qualify: 40 }, pts: { golden: 8000, qualify: 8000 }, zones: 12, ft: null, hourBonus: 0,
       checkins: [] },
   };
+  const COMP_ONLY_GOALS = ['full', 'golden', 'qualify']; // not offered for training plans
+  const isTraining = p => !!p && p.format === 'T';
+  const trainDur = p => Math.max(0.5, Math.min(24, +p.dur || 3));
+  // the format settings for a plan (training plans carry their own length and start)
+  const FMT = p => isTraining(p) ? Object.assign({}, FORMATS.T, { dur: trainDur(p), startHour: p.start }) : FORMATS[p.format];
+  // which comp format's tables (pace, buffer, crossings...) a plan borrows: training uses the 12-hour ones up to 12 hours
+  const fk = p => isTraining(p) ? (trainDur(p) > 12 ? '24' : '12') : p.format;
   const INTENSITY = {
     conservative: { label: "Don't Hurt Me", ceil: [0, -1, -2, -1], hard: 1, walk: 70, walkPrep: 2, breaks: 10, walkName: 'an easy walk (about 4.2 km/h)' },
     standard: { label: 'Bring it On!', ceil: [1, 0, -1, 0], hard: 2, walk: 90, walkPrep: 1, breaks: 5, walkName: 'a fast walk (about 5.4 km/h)' },
@@ -76,7 +85,7 @@
     let state = store.get('hhh.plans', null);
     if (!state || !Array.isArray(state.plans)) state = { active: null, plans: [] };
     // Official start: 12-hour 7:30 am, 24-hour 10:00 am. plan.startCustom keeps an edited start (practice runs).
-    const fixStart = p => { if (p && FORMATS[p.format] && !(p.startCustom && Number.isFinite(p.start))) { p.start = FORMATS[p.format].startHour; delete p.startCustom; } return p; };
+    const fixStart = p => { if (p && FORMATS[p.format] && !isTraining(p) && !(p.startCustom && Number.isFinite(p.start))) { p.start = FORMATS[p.format].startHour; delete p.startCustom; } return p; };
     state.plans.forEach(fixStart);
     const save = () => store.set('hhh.plans', state);
     const active = () => state.plans.find(p => p.id === state.active) || null;
@@ -103,6 +112,17 @@
       const [y, m, d] = plan.date.split('-').map(Number);
       return (ct - new Date(y, m - 1, d)) / 3600000;
     }
+    // Training plans have no fixed date or start: until GO is pressed they start "now" (today, the next 5 minutes);
+    // GO sets the real start, so the timeline, the clock and the angel and demon run from that moment.
+    function chicagoNow() { const ct = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' }));
+      return { ymd: `${ct.getFullYear()}-${String(ct.getMonth() + 1).padStart(2, '0')}-${String(ct.getDate()).padStart(2, '0')}`, hour: ct.getHours() + ct.getMinutes() / 60 }; }
+    function rollTraining(plan) {
+      if (!isTraining(plan) || plan.goAt) return false;
+      const n = chicagoNow(), h = Math.ceil(n.hour * 12) / 12;
+      if (plan.date === n.ymd && Math.abs(plan.start - h) < 1e-6) return false;
+      plan.date = n.ymd; plan.start = h; return true;
+    }
+    function startTraining(plan) { const n = chicagoNow(); plan.date = n.ymd; plan.start = n.hour; plan.goAt = new Date().toISOString(); }
     // GO! pressed when the gun went: plan.goAt (ISO). Everything live runs from that moment instead of the scheduled start,
     // so a long roll call doesn't make you look behind. gunShift = how late the gun was, in hours.
     const gunShift = plan => plan.goAt ? clockOf(plan, plan.goAt) - plan.start : 0;
@@ -156,7 +176,7 @@
     function slowF(plan, abs, lt) {
       if (plan.fatigue === false) return lt && lt !== 'day' ? 1.1 : 1;
       const hrs = Math.max(0, abs - plan.start), k = push(plan).slow;
-      return (1 + (FATIGUE[plan.format] ?? 0.01) * k * hrs) * (lt && lt !== 'day' ? 1 + (DARK_SLOW - 1) * k : 1);
+      return (1 + (FATIGUE[fk(plan)] ?? 0.01) * k * hrs) * (lt && lt !== 'day' ? 1 + (DARK_SLOW - 1) * k : 1);
     }
     // Bring it On! is the learned case; Death Incarnate holds pace better, Don't Hurt Me slows a lot more.
     const SLOW_SCALE = { aggressive: 0.75, standard: 1, conservative: 2 };
@@ -179,15 +199,15 @@
     // Death Incarnate's one search knob x: below 0 eases the climbing pace with Bring it On!'s settings;
     // 0 to 1 raises effort (breaks, changeovers, walking, slowdown) and climbing pace together up to all-out.
     function setEffort(plan, x) {
-      const pf0 = FIXED_PACE.standard[plan.format] || 0.6;
+      const pf0 = FIXED_PACE.standard[fk(plan)] || 0.6;
       plan.effortX = x; plan.effort = Math.max(0, x);
       plan.paceF = x < 0 ? pf0 + (3 - pf0) * -x : pf0 - (pf0 - 0.3) * x;
     }
     const changeMin = plan => push(plan).change;
-    const fixedPace = plan => plan._fixedPace ?? ((FIXED_PACE[plan.intensity] || {})[plan.format] || 0);
+    const fixedPace = plan => plan._fixedPace ?? ((FIXED_PACE[plan.intensity] || {})[fk(plan)] || 0);
     // Optional expected line at the easy end routes (plan.lineMin). Off by default: the goal buffer covers waits like this.
     const LINE_DEFAULT = { 12: 0, 24: 0 };
-    const lineMin = plan => plan.lineMin ?? LINE_DEFAULT[plan.format] ?? 30;
+    const lineMin = plan => plan.lineMin ?? LINE_DEFAULT[fk(plan)] ?? 30;
     function queueMin(plan, r) {
       if (!r.sp) return 0;
       const L = lineMin(plan);
@@ -216,7 +236,7 @@
 
     // ---------- timeline + stats ----------
     function fixedEvents(plan) {
-      const F = FORMATS[plan.format];
+      const F = FMT(plan);
       const off = plan.start - F.startHour; // a moved start keeps check-ins at the same hours into the event
       return F.checkins.map(c => ({ kind: 'checkin', at: c.at + off, min: 10, label: off ? `Check-in (${Sun.fmt((c.at + off) % 24)}–${Sun.fmt((c.end + off) % 24)} window)` : c.label })).filter(e => e.at >= plan.start && e.at < plan.start + F.dur);
     }
@@ -262,7 +282,7 @@
       }
     }
     function timeline(plan, items, upto) {
-      const F = FORMATS[plan.format], end = plan.start + F.dur;
+      const F = FMT(plan), end = plan.start + F.dur;
       const clock = fixedClock(plan);
       const rows = [], stats = blankStats(plan);
       let t = plan.start, area = START_AREA;
@@ -288,7 +308,7 @@
     const normRows = tl => tl;
 
     function achievements(plan, s) {
-      const F = FORMATS[plan.format], fmt = plan.format;
+      const F = FMT(plan), fmt = plan.format;
       const allZones = fmt === '24' ? s.zones.size >= 24 : s.zones.size >= 12;
       const full = s.laps >= F.laps.full && allZones && s.specials.size >= 2;
       const hoursAll = Array.from({ length: F.dur }, (_, h) => s.hours.has(h)).every(Boolean);
@@ -297,11 +317,11 @@
       const qual = full || s.laps >= F.laps.qualify || s.trad >= F.trad.qualify || total >= F.pts.qualify || (F.ft && s.ft >= F.ft);
       return { full, golden, qual, hoursAll, allZones };
     }
-    function bonusPts(plan, s, a) { return (s.east ? 300 : 0) + (a.hoursAll && FORMATS[plan.format].hourBonus ? FORMATS[plan.format].hourBonus : 0); }
+    function bonusPts(plan, s, a) { return (s.east ? 300 : 0) + (a.hoursAll && FMT(plan).hourBonus ? FMT(plan).hourBonus : 0); }
 
     // ---------- optimizer ----------
     function optimize(plan, keep) {
-      const F = FORMATS[plan.format], end = plan.start + F.dur;
+      const F = FMT(plan), end = plan.start + F.dur;
       const items = plan.items.slice(0, keep);
       const tl = normRows(timeline(plan, items));
       let t = tl.t, area = tl.area; const stats = tl.stats;
@@ -318,7 +338,7 @@
       const POS = {}; for (const a of Object.keys(byArea)) POS[a] = GRP[a] ? linePos(AREAS()[a]) : null;
       const WZ = {}; for (const r of pool) if (r.zn != null) (WZ[r.area] ||= new Set()).add(r.zn);
       let dir = 0, lastPos = null, turns = 0; // sweep direction along the cliff line; reversing costs extra and is limited
-      const maxCross = MAX_CROSS[plan.format] ?? 1;
+      const maxCross = MAX_CROSS[fk(plan)] ?? 1;
       // side state carried over from any kept items
       let curG = null, crossings = 0; const left = new Set(); let prevA = START_AREA;
       for (const it of items) { const r = it.rid && byId[it.rid]; if (!r) continue; const g = sideGroup(r.side);
@@ -348,7 +368,7 @@
       const simple = routingOf(plan) !== 'flexible';
       const PIDX = Object.fromEntries(PATH.map((a, i) => [a, i]));
       let pos = items.length && PIDX[area] != null ? PIDX[area] : -1, pdir = 1, flips = 0;
-      const maxFlips = plan.format === '24' ? 2 : 1;
+      const maxFlips = fk(plan) === '24' ? 2 : 1;
       // coverage goals: plan a walking tour through every zone first (nearest neighbour + 2-opt), then follow it
       let tour = [];
       if (goal === 'full' || goal === 'golden') {
@@ -502,7 +522,7 @@
           if (sp === 'shade' && rs[0].side === 'East' && hh >= 12 && pre.lt === 'day') { const st = sunAt(plan, rs[0], t + w / 60); sunF = st === 'sun' ? 0.4 : st === 'partial' ? 0.65 : 0.9; }
           else if (sp === 'sun' && pre.lt === 'day') { const st = sunAt(plan, rs[0], t + w / 60); sunF = st === 'sun' ? 1 : st === 'partial' ? 0.85 : st === 'shade' ? 0.65 : 0.8; }
           // what the top teams do: the dense North Forty core first, while fresh; the ends and the East side later
-          if (coreFirst && t - plan.start < CORE_H[plan.format] && rs[0].side !== 'North') sunF *= 0.6;
+          if (coreFirst && t - plan.start < CORE_H[fk(plan)] && rs[0].side !== 'North') sunF *= 0.6;
           const opts = []; for (const r of rs) { const e = evalRoute(r, t + w / 60); if (e && t + (w + e.mins) / 60 <= end && !(strict && plan.together !== false && e.who.length < WHO.length)) opts.push(e); }
           if (!opts.length) continue;
           opts.sort((x, y) => y.v / y.mins - x.v / x.mins);
@@ -557,14 +577,16 @@
 
     // ---------- targets and required pace ----------
     // a plan can chase several goals at once (e.g. 100 laps AND 5,280 ft); all of them must be met
-    const goalsOf = plan => (Array.isArray(plan.goals) ? plan.goals : plan.goal ? [plan.goal] : []).filter(g => GOALS[g]); // new plans start with no goals
+    const goalsOf = plan => (Array.isArray(plan.goals) ? plan.goals : plan.goal ? [plan.goal] : []).filter(g => GOALS[g] && !(isTraining(plan) && COMP_ONLY_GOALS.includes(g))); // new plans start with no goals
     function targetOf(plan, g = goalsOf(plan)[0]) {
       if (!UNIT[g]) return null;
       const t = plan.targets && plan.targets[g];
-      return t > 0 ? t : TARGET_DEFAULT[plan.format][g];
+      if (t > 0) return t;
+      if (isTraining(plan)) { const d = TARGET_DEFAULT[12][g] * trainDur(plan) / 12; return Math.max(1, Math.round(d / (d > 500 ? 100 : 1)) * (d > 500 ? 100 : 1)); }
+      return TARGET_DEFAULT[plan.format][g];
     }
     function lapTarget(plan) {
-      const F = FORMATS[plan.format]; let L = null;
+      const F = FMT(plan); let L = null;
       for (const g of goalsOf(plan)) {
         const n = g === 'laps' ? targetOf(plan, g) : g === 'full' || g === 'qualify' ? F.laps.full : g === 'golden' ? F.laps.golden : null;
         if (n != null) L = Math.max(L || 0, n);
@@ -585,12 +607,13 @@
     }
     // Contingency: each goal should be done this many hours before the end (lost phone, a queue for a must-have route...).
     const BUFFER = { full: { 24: 4, 12: 2 }, qualify: { 24: 4, 12: 2 }, golden: { 24: 2, 12: 1 }, laps: { 24: 2, 12: 1 }, score: { 24: 2, 12: 1 }, height: { 24: 2, 12: 1 }, trad: { 24: 2, 12: 1 } };
-    const bufferOf = (plan, g) => ((BUFFER[g] || {})[plan.format] || 0) * (plan.bufF ?? 1);
+    const hrs = h => h < 1 ? Math.round(h * 60) + ' min' : (Math.round(h * 10) / 10) + ' h'; // buffer lengths: minutes under an hour
+    const bufferOf = (plan, g) => (isTraining(plan) ? ((BUFFER[g] || {})[12] || 0) * trainDur(plan) / 12 : ((BUFFER[g] || {})[plan.format] || 0)) * (plan.bufF ?? 1);
     // when each goal is first met by both climbers (absolute hours), replaying the plan route by route
     function goalTimes(plan, tl) {
       tl = tl || timeline(plan, plan.items);
       const gs = goalsOf(plan), out = Object.fromEntries(gs.map(g => [g, null])); if (!gs.length) return out;
-      const st = blankStats(plan), F = FORMATS[plan.format];
+      const st = blankStats(plan), F = FMT(plan);
       for (const row of tl.rows) {
         if (row.kind !== 'route') continue;
         applyRoute(plan, st, row.r, row.who, row.t1);
@@ -608,7 +631,7 @@
       return out;
     }
     function meets(plan) {
-      const end = plan.start + FORMATS[plan.format].dur, gt = goalTimes(plan);
+      const end = plan.start + FMT(plan).dur, gt = goalTimes(plan);
       return goalsOf(plan).every(g => gt[g] != null && gt[g] <= end - bufferOf(plan, g) + 1e-6);
     }
     const goalText = plan => goalsOf(plan).map(g => GOALS[g].replace(/ \(.*\)/, '').toLowerCase() + (targetOf(plan, g) ? ' ' + targetOf(plan, g).toLocaleString() : '')).join(' + ');
@@ -653,7 +676,7 @@
     }
     // What the plan asks of you, climbing and everything else, at the chosen push level
     function pacingTable(plan, tl, climbM) {
-      const P = push(plan), F = FORMATS[plan.format], c = climber(plan, 'me'), I = INTENSITY[plan.intensity] || INTENSITY.standard;
+      const P = push(plan), F = FMT(plan), c = climber(plan, 'me'), I = INTENSITY[plan.intensity] || INTENSITY.standard;
       const tbl = el('table', 'sumtable pacing'); const h = el('tr'); const th = el('th', null, 'Pacing'); th.colSpan = 2; h.appendChild(th); tbl.appendChild(h);
       const row = (k, v, title) => { const tr = el('tr'); tr.append(el('th', null, k), el('td', null, v)); if (title) tr.title = title; tbl.appendChild(tr); };
       if (plan.intensity === 'aggressive' && !plan.manual && plan.effortX != null) {
@@ -669,7 +692,7 @@
       if (laps) row('Per route', `${(climbM / laps).toFixed(1)} min average for the pair (both leads + changeover)`);
       row('Walking', `${Math.round(P.walk)} m/min (about ${(P.walk * 60 / 1609.34).toFixed(1)} mph) plus ${P.walkPrep.toFixed(1)} min to pack up at each move`);
       const bm = breakMin(plan); row('Breaks', bm ? `${bm} min every hour (about ${(bm * F.dur / 60).toFixed(1)} h in all)` : 'None');
-      row('Slowdown', plan.fatigue === false ? 'Off (only 10% slower in the dark)' : `+${((FATIGUE[plan.format] ?? 0.01) * P.slow * 100).toFixed(1)}% lead time per hour into the event, +${((DARK_SLOW - 1) * P.slow * 100).toFixed(1)}% in the dark`);
+      row('Slowdown', plan.fatigue === false ? 'Off (only 10% slower in the dark)' : `+${((FATIGUE[fk(plan)] ?? 0.01) * P.slow * 100).toFixed(1)}% lead time per hour into the event, +${((DARK_SLOW - 1) * P.slow * 100).toFixed(1)}% in the dark`);
       return tbl;
     }
     const walkOf = plan => { let w = 0; for (const r of timeline(plan, plan.items).rows) if (r.kind === 'walk') w += (r.t1 - r.t0) * 60; return w; };
@@ -693,7 +716,7 @@
 
     // ---------- Go Time: live metrics against the active plan ----------
     function liveStats(plan, now) {
-      const F = FORMATS[plan.format], start = plan.start, end = start + F.dur;
+      const F = FMT(plan), start = plan.start, end = start + F.dur;
       const tl = timeline(plan, plan.items), R = tl.rows.filter(r => r.kind === 'route');
       const [y, m, d] = plan.date.split('-').map(Number), base = new Date(y, m - 1, d);
       const sh = gunShift(plan), absOf = iso => clockOf(plan, iso) - sh;
@@ -793,7 +816,7 @@
       }
       const out = {};
       for (const k of WHO) {
-        const s = st[k], a = achievements(plan, s), F = FORMATS[plan.format];
+        const s = st[k], a = achievements(plan, s), F = FMT(plan);
         const east = s.east ? 300 : 0, hour = a.hoursAll && F.hourBonus ? F.hourBonus : 0; // the rules also need your partner every hour
         const pts = rows[k].reduce((a, x) => a + x.pts, 0), unset = rows[k].filter(x => x.r.type === 'trad' && !x.style).length;
         out[k] = { name: climber(plan, k).name, rows: rows[k].sort((p, q) => (p.r.n || 9999) - (q.r.n || 9999)), pts, unset, east, hour, total: pts + east + hour, laps: s.laps, trad: s.trad, ft: s.ft, hoursCovered: s.hours.size, hoursAll: a.hoursAll };
@@ -802,7 +825,7 @@
     }
     function renderScorecard(box, plan) {
       // this phone's climber only: each climber keeps their own scorecard in their own copy of the app
-      const sc = scorecard(plan), who = 'me', F = FORMATS[plan.format];
+      const sc = scorecard(plan), who = 'me', F = FMT(plan);
       const c = sc[who];
       // 24-hour: the first card goes in at the evening check-in, so split the list at the moment you say you handed it in
       let part = 'all', rows = c.rows;
@@ -868,7 +891,7 @@
         }
         lines.push([c.name, '', 'Route points' + (c.unset ? ` (${c.unset} trad not marked, counted as RP)` : ''), '', '', '', '', c.ft, c.pts].map(q).join(','));
         lines.push([c.name, '', 'East Side bonus', '', '', '', '', '', c.east].map(q).join(','));
-        if (FORMATS[plan.format].hourBonus) lines.push([c.name, '', 'One Each Hour bonus', '', '', '', '', '', c.hour].map(q).join(','));
+        if (FMT(plan).hourBonus) lines.push([c.name, '', 'One Each Hour bonus', '', '', '', '', '', c.hour].map(q).join(','));
         lines.push([c.name, '', `Total (${c.laps} routes, ${c.trad} trad)`, '', '', '', '', c.ft, c.total].map(q).join(','));
       }
       const safe = plan.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'plan';
@@ -925,22 +948,23 @@
       box.textContent = '';
       clearInterval(goTimer); goTimer = setInterval(() => { if (ui.tab === 'go' && document.visibilityState === 'visible') renderGo(box); }, 30000);
       const plan = active();
+      if (plan && rollTraining(plan)) save();
       box.appendChild(el('h2', null, 'Go Time!'));
       if (!plan || !plan.items.length) { box.appendChild(el('p', 'hint', 'Build a plan in the Planning tab first. This page then tracks how you\'re doing against it as you tick climbs off.')); return; }
       { // the gun: GO! starts the clock for this plan; shown from 3 hours before the scheduled start until it's pressed
         const realNow = clockOf(plan, Date.now());
         if (!plan.goAt) { // always shown; live only within an hour either side of the scheduled start
-          const live = realNow >= plan.start - 1 && realNow <= plan.start + 1;
+          const live = isTraining(plan) || (realNow >= plan.start - 1 && realNow <= plan.start + 1); // training: GO whenever you start
           const g = el('button', 'go-gun', 'GO!'); g.type = 'button'; g.disabled = !live;
-          g.onclick = () => { plan.goAt = new Date().toISOString(); save(); renderGo(box); };
-          const msg = live ? `Press when the gun goes. Until then the clock assumes ${fmtAbs(plan, plan.start, true)}.`
+          g.onclick = () => { if (isTraining(plan)) startTraining(plan); else plan.goAt = new Date().toISOString(); save(); renderGo(box); ctx.onPlanChange && ctx.onPlanChange(); };
+          const msg = isTraining(plan) ? `Press GO when you start. The ${FMT(plan).dur}-hour clock, the plan's times and the angel and demon all run from then.` : live ? `Press when the gun goes. Until then the clock assumes ${fmtAbs(plan, plan.start, true)}.`
             : realNow < plan.start - 1 ? `Unlocks at ${fmtAbs(plan, plan.start - 1, true)}, an hour before the scheduled start. Press it when the gun goes.`
             : `The GO! window closed at ${fmtAbs(plan, plan.start + 1, true)}; times run from the scheduled ${fmtAbs(plan, plan.start, true)}.`;
           const wrapG = el('div', 'go-gunrow'); wrapG.append(g, el('span', 'hint small', msg));
           box.appendChild(wrapG);
         } else {
           const late = Math.round(gunShift(plan) * 60), row = el('p', 'go-started hint small');
-          row.append(`Started at ${fmtAbs(plan, clockOf(plan, plan.goAt), true)}` + (late ? ` (${Math.abs(late)} min ${late > 0 ? 'late' : 'early'})` : '') + `; times run from the gun. `);
+          row.append(`Started at ${fmtAbs(plan, clockOf(plan, plan.goAt), true)}` + (late ? ` (${Math.abs(late)} min ${late > 0 ? 'late' : 'early'})` : '') + (isTraining(plan) ? '; times run from your start. ' : '; times run from the gun. '));
           const u = el('button', 'link', 'Undo'); u.type = 'button'; u.onclick = () => { if (!confirm('Clear the start time and go back to the scheduled start?')) return; delete plan.goAt; save(); renderGo(box); };
           row.appendChild(u); box.appendChild(row);
         } }
@@ -1037,12 +1061,12 @@
     const flat = stops => stops.flatMap(s => s.items);
     function stopWalk(plan, stops) { let w = 0, a = START_AREA; for (const s of stops) { if (!s.area) continue; w += walkMin(a, s.area, plan); a = s.area; } return w; }
     function keepsRules(plan, items) {
-      const F = FORMATS[plan.format], end = plan.start + F.dur, I = INTENSITY[plan.intensity] || INTENSITY.standard;
+      const F = FMT(plan), end = plan.start + F.dur, I = INTENSITY[plan.intensity] || INTENSITY.standard;
       const saved = plan.items; plan.items = items;
       try {
         const tl = timeline(plan, items);
         if (tl.t > end + 0.01) return false;
-        if (countCrossings(plan) > (MAX_CROSS[plan.format] ?? 1)) return false;
+        if (countCrossings(plan) > (MAX_CROSS[fk(plan)] ?? 1)) return false;
         const cl = Object.fromEntries(WHO.map(k => [k, climber(plan, k)]));
         const laps = { me: 0, partner: 0 }, hard = { me: {}, partner: {} };
         for (const row of tl.rows) {
@@ -1091,7 +1115,7 @@
     // ---------- plan CRUD ----------
     function newPlan(fmt) {
       fmt = fmt || '24';
-      const p = { id: 'p' + Date.now().toString(36), name: (fmt === '24' ? '24-hour' : '12-hour') + ' plan', format: fmt, date: defaultDate(fmt), start: FORMATS[fmt].startHour,
+      const p = { id: 'p' + Date.now().toString(36), name: (fmt === '24' ? '24-hour' : fmt === 'T' ? 'Training' : '12-hour') + ' plan', format: fmt, date: fmt === 'T' ? chicagoNow().ymd : defaultDate(fmt), start: FORMATS[fmt].startHour, dur: fmt === 'T' ? 3 : undefined,
         goals: [], targets: {}, side: { east: true, over60: false, soft: true }, divs: {}, intensity: 'standard', avoidSun: true, reach: true, items: [] };
       state.plans.push(p); state.active = p.id; save(); return p;
     }
@@ -1107,6 +1131,7 @@
       const y = window.scrollY; requestAnimationFrame(() => window.scrollTo(0, y)); // keep your place while editing
       const body = $('#planBody'); body.textContent = '';
       let plan = active();
+      if (plan && rollTraining(plan)) save();
       // header: plan picker
       const top = el('div', 'plan-top');
       const sel = el('select'); sel.setAttribute('aria-label', 'Plan');
@@ -1164,7 +1189,7 @@
       const { d, body } = popup('Shared plan');
       const nm = k => (pr && pr[k] && pr[k].name) || (k === 'me' ? 'Climber 1' : 'Climber 2');
       const exists = state.plans.some(p => p.id === inc.id);
-      body.appendChild(el('p', null, `“${inc.name}”${from ? ' from ' + from : ''}: ${FORMATS[inc.format] ? FORMATS[inc.format].label : ''}, ${inc.items.filter(x => x.rid).length} routes${inc.items.some(x => x.done) ? ', ' + inc.items.filter(x => x.done).length + ' ticked' : ''}.` + (exists ? ' This replaces your copy of it.' : '')));
+      body.appendChild(el('p', null, `“${inc.name}”${from ? ' from ' + from : ''}: ${FMT(inc) ? FMT(inc).label : ''}, ${inc.items.filter(x => x.rid).length} routes${inc.items.some(x => x.done) ? ', ' + inc.items.filter(x => x.done).length + ' ticked' : ''}.` + (exists ? ' This replaces your copy of it.' : '')));
       const cbL = el('label', 'check'); const cb = el('input'); cb.type = 'checkbox'; cb.checked = !!pr && !(profiles.me.onsight && profiles.partner.onsight);
       cbL.append(cb, el('span', null, 'Also fill in Climber Setup with both climbers\' grades'));
       if (pr) body.appendChild(cbL);
@@ -1210,9 +1235,9 @@
       // stays as the user left it across re-renders; collapses only after a (re)build
       const d = el('details', 'setup'); d.open = setupOpen[plan.id] ?? !plan.items.length;
       d.addEventListener('toggle', () => { setupOpen[plan.id] = d.open; });
-      d.appendChild(el('summary', null, `${FORMATS[plan.format].label}, ` + (goalsOf(plan).length ? `optimizing for ${goalText(plan)}` : 'no goals picked yet')));
+      d.appendChild(el('summary', null, `${FMT(plan).label}, ` + (goalsOf(plan).length ? `optimizing for ${goalText(plan)}` : 'no goals picked yet')));
       const upd = fn => () => { fn(); save(); render(); };
-      const F = FORMATS[plan.format], sel = goalsOf(plan), I = INTENSITY[plan.intensity] || INTENSITY.standard;
+      const F = FMT(plan), sel = goalsOf(plan), I = INTENSITY[plan.intensity] || INTENSITY.standard;
       const so = (secOpen[plan.id] ||= {});
       // collapsible section with a one-line summary of what's set
       const section = (key, title, sum, openByDefault) => {
@@ -1227,36 +1252,47 @@
 
       // ---- Event ----
       { const dd = dh(plan, plan.start);
-        const b = section('event', 'Event', `${F.label} · ${dd.wd} ${plan.date.slice(5).replace('-', '/')}${plan.startCustom ? ' · practice ' + Sun.fmt(plan.start) : ''}`, false);
+        const b = section('event', 'Event', isTraining(plan) ? `Training · ${trainDur(plan)} h${plan.goAt ? ' · started ' + Sun.fmt(dh(plan, clockOf(plan, plan.goAt)).hour) : ''}` : `${F.label} · ${dd.wd} ${plan.date.slice(5).replace('-', '/')}${plan.startCustom ? ' · practice ' + Sun.fmt(plan.start) : ''}`, false);
         const name = el('input'); name.type = 'text'; name.value = plan.name; name.onchange = () => { plan.name = name.value.trim() || plan.name; save(); render(); };
         b.appendChild(field('Plan name', name));
-        b.appendChild(field('Format', segRow([['24', '24-hour'], ['12', '12-hour']], plan.format, v => upd(() => { plan.format = v; plan.date = defaultDate(v); plan.start = FORMATS[v].startHour; delete plan.startCustom; plan.items = []; })())));
-        const date = el('input'); date.type = 'date'; date.value = plan.date; date.onchange = () => { if (date.value) { plan.date = date.value; save(); render(); } };
-        b.appendChild(field('Start date', date));
-        const tm = el('input'); tm.type = 'time'; tm.step = 60;
-        const hhmm = h => String(Math.floor(h)).padStart(2, '0') + ':' + String(Math.round((h % 1) * 60)).padStart(2, '0');
-        tm.value = hhmm(plan.start);
-        tm.onchange = () => { const m = /^(\d{1,2}):(\d{2})/.exec(tm.value || ''); if (!m) return;
-          const h = +m[1] + +m[2] / 60; if (Math.abs(h - plan.start) < 1e-6) return;
-          plan.start = h; if (Math.abs(h - F.startHour) < 1e-6) delete plan.startCustom; else plan.startCustom = true;
-          delete plan.goAt; save(); render(); };
-        const runs = `Runs ${[plan.start, plan.start + F.dur].map(h => { const x = dh(plan, h); return x.wd + ' ' + Sun.fmt(x.hour); }).join(' to ')}.`;
-        const custom = Math.abs(plan.start - F.startHour) > 1e-6;
-        const tf = field('Start time', tm, custom ? `${runs} Practice start; the comp starts at ${Sun.fmt(F.startHour)}.${plan.items.length ? ' Rebuild the plan so light, check-ins and breaks follow the new time.' : ''}` : `${runs} Official start. Change it for a practice run.`);
-        if (custom) { const rs = el('button', 'btn small', `Reset to ${Sun.fmt(F.startHour)}`); rs.type = 'button';
-          rs.onclick = () => { plan.start = F.startHour; delete plan.startCustom; delete plan.goAt; save(); render(); }; tf.appendChild(rs); }
-        b.appendChild(tf); }
+        b.appendChild(field('Format', segRow([['24', '24-hour'], ['12', '12-hour'], ['T', 'Training']], plan.format, v => upd(() => {
+          const was = plan.format; plan.format = v; delete plan.startCustom; delete plan.goAt; delete plan.card1At; plan.items = [];
+          if (v === 'T') { plan.dur = plan.dur || 3; rollTraining(plan); plan.goals = goalsOf(plan); plan.goal = plan.goals[0]; if (/^(24|12)-hour plan$/.test(plan.name)) plan.name = 'Training plan'; }
+          else { plan.date = defaultDate(v); plan.start = FORMATS[v].startHour; if (was === 'T' && plan.name === 'Training plan') plan.name = (v === '24' ? '24-hour' : '12-hour') + ' plan'; }
+        })())));
+        if (isTraining(plan)) {
+          const du = el('input'); du.type = 'number'; du.min = 0.5; du.max = 24; du.step = 0.5; du.inputMode = 'decimal'; du.value = trainDur(plan);
+          du.onchange = () => { const v = Math.max(0.5, Math.min(24, Math.round((+du.value || 3) * 2) / 2)); if (v === trainDur(plan)) { du.value = v; return; } plan.dur = v; plan.items = []; save(); render(); };
+          const row = el('div', 'target-row'); row.append(du, el('span', null, 'hours'));
+          b.appendChild(field('Duration', row, plan.goAt ? `Started ${fmtAbs(plan, clockOf(plan, plan.goAt), true)}; runs to ${fmtAbs(plan, plan.start + F.dur, true)}.` : 'No date or start time: the clock starts when you press GO on Go Time!. Build the plan any time before.'));
+        } else {
+          const date = el('input'); date.type = 'date'; date.value = plan.date; date.onchange = () => { if (date.value) { plan.date = date.value; save(); render(); } };
+          b.appendChild(field('Start date', date));
+          const tm = el('input'); tm.type = 'time'; tm.step = 60;
+          const hhmm = h => String(Math.floor(h)).padStart(2, '0') + ':' + String(Math.round((h % 1) * 60)).padStart(2, '0');
+          tm.value = hhmm(plan.start);
+          tm.onchange = () => { const m = /^(\d{1,2}):(\d{2})/.exec(tm.value || ''); if (!m) return;
+            const h = +m[1] + +m[2] / 60; if (Math.abs(h - plan.start) < 1e-6) return;
+            plan.start = h; if (Math.abs(h - F.startHour) < 1e-6) delete plan.startCustom; else plan.startCustom = true;
+            delete plan.goAt; save(); render(); };
+          const runs = `Runs ${[plan.start, plan.start + F.dur].map(h => { const x = dh(plan, h); return x.wd + ' ' + Sun.fmt(x.hour); }).join(' to ')}.`;
+          const custom = Math.abs(plan.start - F.startHour) > 1e-6;
+          const tf = field('Start time', tm, custom ? `${runs} Practice start; the comp starts at ${Sun.fmt(F.startHour)}.${plan.items.length ? ' Rebuild the plan so light, check-ins and breaks follow the new time.' : ''}` : `${runs} Official start. Change it for a practice run.`);
+          if (custom) { const rs = el('button', 'btn small', `Reset to ${Sun.fmt(F.startHour)}`); rs.type = 'button';
+            rs.onclick = () => { plan.start = F.startHour; delete plan.startCustom; delete plan.goAt; save(); render(); }; tf.appendChild(rs); }
+          b.appendChild(tf);
+        } }
 
       // ---- Goals ----
       { const sum = sel.length ? sel.map(k => GOALS[k].replace(/ \(.*\)/, '') + (targetOf(plan, k) ? ' ' + targetOf(plan, k).toLocaleString() : '')).join(' + ') : 'none yet';
         const b = section('goals', 'Goals', sum, fresh || !sel.length);
-        const g = chipRow(Object.entries(GOALS).map(([k, v]) => [k, v.replace(/ \(.*\)/, '')]), Object.fromEntries(sel.map(k => [k, true])), v => upd(() => {
+        const g = chipRow(Object.entries(GOALS).filter(([k]) => !(isTraining(plan) && COMP_ONLY_GOALS.includes(k))).map(([k, v]) => [k, v.replace(/ \(.*\)/, '')]), Object.fromEntries(sel.map(k => [k, true])), v => upd(() => {
           const n = sel.includes(v) ? sel.filter(x => x !== v) : [...sel, v]; plan.goals = n; plan.goal = n[0];
         })(), false);
         const gHint = { score: `Favors soft, shaded, high-point routes. ${F.pts.qualify.toLocaleString()} points (bonuses included) qualifies for next year.`, laps: `Fastest routes you can lead cleanly. ${F.laps.qualify} laps qualifies for next year.`, trad: `Trad leads count toward this. ${F.trad.qualify} trad laps qualifies for next year.`, height: F.ft ? `Favors tall routes. ${F.ft.toLocaleString()} ft also qualifies for next year.` : 'Favors tall routes.',
           full: `${F.laps.full} routes, ${plan.format === '24' ? 'all 24' : '12'} zones, and one end route at each end of the horseshoe (west: Hickadelic Jazzgrass, Meatcake, Catholic Boat, Elephant Ear or Wuwei; east: Orange Crush, Montezuma's Toe or Revenge, Purple Nehi or Supersoul Sureshot).`, golden: `${F.laps.golden} routes, ${F.trad.golden} trad, ${F.pts.golden.toLocaleString()} points and Full Horseshoe.`,
           qualify: 'Plans for the Full Horseshoe, the cheapest qualifying path for most teams.' };
-        b.appendChild(field('Optimize for', g, (sel.length ? 'The plan has to hit all of them. ' : 'Pick one or more to get a recommended plan, or build it yourself below.') + sel.map(k => gHint[k]).join(' ')));
+        b.appendChild(field('Optimize for', g, (sel.length ? 'The plan has to hit all of them. ' : 'Pick one or more to get a recommended plan, or build it yourself below.') + sel.map(k => isTraining(plan) ? (gHint[k] || '').replace(/ [^.]*qualif[^.]*\./g, '') : gHint[k]).join(' ')));
         const tbox = el('div', 'targets');
         for (const k of sel.filter(k => UNIT[k])) {
           const ti = el('input'); ti.type = 'number'; ti.inputMode = 'numeric'; ti.min = 1; ti.step = k === 'laps' || k === 'trad' ? 1 : 100; ti.value = targetOf(plan, k); ti.setAttribute('aria-label', GOALS[k]);
@@ -1286,9 +1322,9 @@
         const brow = el('div', 'target-row'); brow.append(bi, el('span', null, 'min, once an hour'));
         b.appendChild(field('Breaks', brow, plan.intensity === 'aggressive' ? (plan.breakMin == null ? 'Scales from 5 down to 0 with your target. Type a number to fix it.' : 'Fixed by you. Clear the box to let it scale with the target.') : `${I.label} suggests ${I.breaks} min.`));
         b.appendChild(toggle('Slow down as the hours pile up', plan.fatigue !== false, v => upd(() => { plan.fatigue = v ? undefined : false; })(),
-          plan.fatigue !== false ? (k => `Leads take about ${((FATIGUE[plan.format] ?? 0.01) * k * 100).toFixed(1)}% longer per hour into the event and ${Math.round((DARK_SLOW - 1) * k * 100)}% longer in the dark, from timed logs of 26 top climbers.`)(push(plan).slow) : 'Off: only a flat 10% slower in the dark.'));
+          plan.fatigue !== false ? (k => `Leads take about ${((FATIGUE[fk(plan)] ?? 0.01) * k * 100).toFixed(1)}% longer per hour into the event and ${Math.round((DARK_SLOW - 1) * k * 100)}% longer in the dark, from timed logs of 26 top climbers.`)(push(plan).slow) : 'Off: only a flat 10% slower in the dark.'));
         const li = el('input'); li.type = 'number'; li.inputMode = 'numeric'; li.min = 0; li.max = 180; li.value = lineMin(plan);
-        li.onchange = () => { const v = Math.max(0, Math.min(180, Math.round(+li.value || 0))); plan.lineMin = v === LINE_DEFAULT[plan.format] ? undefined : v; save(); render(); };
+        li.onchange = () => { const v = Math.max(0, Math.min(180, Math.round(+li.value || 0))); plan.lineMin = v === LINE_DEFAULT[fk(plan)] ? undefined : v; save(); render(); };
         const lr = el('div', 'target-row'); lr.append(li, el('span', null, 'min'));
         b.appendChild(field('Line at the 5.8 end routes', lr, 'Optional wait at Hickadelic Jazzgrass and Montezuma\'s. Leave at 0 to let the goal buffer cover it.')); }
 
@@ -1344,7 +1380,7 @@
         b.appendChild(field('Side of the canyon', segRow([['', 'Both sides'], ['E', 'East only'], ['W', 'West only']], side, v => upd(() => { plan.sideOnly = v || undefined; plan.startWalls = (plan.startWalls || []).filter(a => !v || sideGroup(sideOf(a)) === v); })()),
           { '': 'Crosses the canyon at most once on the 12-hour, twice on the 24-hour.', E: 'Stays on the East side: no canyon crossing.', W: 'Stays on the West side, North Forty included: no canyon crossing.' }[side]));
         if (side !== 'E') b.appendChild(toggle('Start in the North Forty core', plan.coreFirst !== false, v => upd(() => { plan.coreFirst = v ? undefined : false; })(),
-          list.length ? 'Off while you pick start walls below.' : sel.some(g => g === 'full' || g === 'golden') ? 'Ignored for Full and Golden Horseshoe: the zone tour sets the start.' : `First wall in the North Forty, favored for the first ${CORE_H[plan.format]} hours.`));
+          list.length ? 'Off while you pick start walls below.' : sel.some(g => g === 'full' || g === 'golden') ? 'Ignored for Full and Golden Horseshoe: the zone tour sets the start.' : `First wall in the North Forty, favored for the first ${CORE_H[fk(plan)]} hours.`));
         // starting walls, in order
         const sw = el('div', 'startwalls');
         list.forEach((a, i) => { const c = el('button', 'chip-x', `${i + 1}. ${a.replace(/^The /, '')} ×`); c.type = 'button'; c.setAttribute('aria-label', 'Remove ' + a); c.onclick = upd(() => list.splice(i, 1)); sw.appendChild(c); });
@@ -1395,7 +1431,7 @@
     const GU2 = L => { const m = /^5\.(\d+)([abcd])?/.exec(L); if (!m) return -9; const n = +m[1]; return n >= 10 ? (n - 10) * 4 + (m[2] ? 'abcd'.indexOf(m[2]) : 0) : n - 10; };
     // Grade over time: every planned route as a dot (x = planned start, y = grade), night shaded, onsight lines dashed.
     function timeChart(plan, tl) {
-      const F = FORMATS[plan.format], t0 = plan.start, t1 = plan.start + F.dur;
+      const F = FMT(plan), t0 = plan.start, t1 = plan.start + F.dur;
       const pts = tl.rows.filter(r => r.kind === 'route').map(r => ({ t: r.t0, b: GU2(gradeLabel(r.r.gu, r.r.g)), L: gradeLabel(r.r.gu, r.r.g), row: r }));
       const box = el('figure', 'timechart'); box.appendChild(el('figcaption', null, 'Grade through the event'));
       if (!pts.length) return box;
@@ -1500,7 +1536,7 @@
       return box;
     }
     function renderSummary(body, plan) {
-      const tl = normRows(timeline(plan, plan.items)); const F = FORMATS[plan.format];
+      const tl = normRows(timeline(plan, plan.items)); const F = FMT(plan);
       const sec = el('section', 'psum');
       const tbl = el('table', 'sumtable'); const thead = el('tr'); thead.append(el('th'), ...WHO.map(k => el('th', null, climber(plan, k).name))); tbl.appendChild(thead);
       const ach = Object.fromEntries(WHO.map(k => [k, achievements(plan, tl.stats[k])]));
@@ -1511,11 +1547,13 @@
       rowOf('Trad', s => s.trad);
       rowOf('Zones', s => `${s.zones.size} of 24`);
       const yes = b => b ? 'Yes' : 'No';
-      rowOf('One Each Hour', (s, a) => yes(a.hoursAll));
-      rowOf('East Side', s => yes(s.east));
-      rowOf('Full Horseshoe', (s, a) => yes(a.full));
-      rowOf('Golden Horseshoe', (s, a) => yes(a.golden));
-      rowOf('Qualifies', (s, a) => yes(a.qual));
+      if (!isTraining(plan)) {
+        rowOf('One Each Hour', (s, a) => yes(a.hoursAll));
+        rowOf('East Side', s => yes(s.east));
+        rowOf('Full Horseshoe', (s, a) => yes(a.full));
+        rowOf('Golden Horseshoe', (s, a) => yes(a.golden));
+        rowOf('Qualifies', (s, a) => yes(a.qual));
+      }
       // efficiency: share of moving time (walking + climbing) spent climbing; breaks and check-in stops don't count
       let walkM = 0, climbM = 0;
       for (const r of tl.rows) { const m = (r.t1 - r.t0) * 60; if (r.kind === 'walk') walkM += m; else if (r.kind === 'route') climbM += m; }
@@ -1526,12 +1564,12 @@
       { const gt = goalTimes(plan, tl), gs = goalsOf(plan), end = plan.start + F.dur;
         if (gs.length) {
           const times = gs.map(g => gt[g]); const last = times.some(x => x == null) ? null : Math.max(...times);
-          const aim = Math.max(...gs.map(g => (BUFFER[g] || {})[plan.format] || 0));
+          const aim = Math.max(...gs.map(g => bufferOf({ ...plan, bufF: 1 }, g)));
           const spare = last == null ? null : end - last;
-          teamRow('Goals met by', last == null ? 'Not reached' : `${fmtAbs(plan, last, true)} · ${spare.toFixed(1)} h buffer (aim ${aim} h)`,
+          teamRow('Goals met by', last == null ? 'Not reached' : `${fmtAbs(plan, last, true)} · ${hrs(spare)} buffer (aim ${hrs(aim)})`,
             gs.map(g => `${GOALS[g].replace(/ \(.*\)/, '')}: ${gt[g] == null ? 'not reached' : fmtAbs(plan, gt[g], true)}`).join('; '));
           const gr = tbl.lastChild; gr.classList.add('goalsby'); tbl.insertBefore(gr, tbl.children[1]); // first row under the names
-          if (last != null && spare < aim - 0.05) sec.appendChild(el('p', 'warn', `Only ${spare.toFixed(1)} h spare after your goals (aim ${aim} h). There's little room for a lost phone or a queue at a must-have route; a harder push level, a higher division or a lower target would buy time.`));
+          if (last != null && spare < aim - 0.05) sec.appendChild(el('p', 'warn', `Only ${hrs(spare)} spare after your goals (aim ${hrs(aim)}). There's little room for a lost phone or a queue at a must-have route; a harder push level, a higher division or a lower target would buy time.`));
         } }
       teamRow('Efficiency', `${letter} · ${Math.round(pct)}% climbing`, 'A: 92%+ of moving time climbing, B: 88%+, C: 84%+, D: 80%+, F: under 80%. Breaks and check-in stops are left out; walks to check-in count.');
       teamRow('Walk : climb', `1 : ${walkM ? (climbM / walkM).toFixed(1) : '∞'} (${hm(walkM)} walking, ${hm(climbM)} climbing)`);
@@ -1547,7 +1585,7 @@
       if (idleM >= 10) { const firstIdle = tl.rows.find(r => r.kind === 'break' && r.i != null && plan.items[r.i] && plan.items[r.i].idle);
         sec.appendChild(el('p', 'warn', `${Math.round(idleM / 60 * 10) / 10} h with nothing to climb, from ${fmtAbs(plan, firstIdle.t0, true)}: you've used up every route that fits your settings within reach. Loosen the hardest grade after dark, the grade range or grade limits, or the hardest trad grade, then rebuild.`)); }
       const cx = countCrossings(plan);
-      sec.appendChild(el('p', 'hint small', `Canyon crossings: ${cx} (limit ${MAX_CROSS[plan.format]}${plan.format === '24' ? ', one is best' : ''}).`));
+      sec.appendChild(el('p', 'hint small', `Canyon crossings: ${cx} (limit ${MAX_CROSS[fk(plan)]}${plan.format === '24' ? ', one is best' : ''}).`));
       const climbing = Math.max(...WHO.map(k => tl.stats[k].laps));
       const rp = el('p', 'pace-calc');
       rp.textContent = `Required pace: ${(climbing / F.dur).toFixed(1)} laps per hour per climber (${climbing} laps over ${F.dur} hours).`;
@@ -1558,7 +1596,7 @@
         const st = WHO.map(k => tl.stats[k]), a = st.map(x => achievements(plan, x)), lo = f => Math.min(...st.map(f));
         const bits = [`${lo(x => x.laps)} laps`, `${lo((x, i) => x.pts).toLocaleString()} points`];
         if (lo(x => x.trad)) bits.push(`${lo(x => x.trad)} trad`);
-        const got = a.every(x => x.full) ? 'Full Horseshoe' : a.every(x => x.qual) ? 'qualifies for next year' : 'not enough to qualify';
+        const got = isTraining(plan) ? `${FMT(plan).dur} h of training` : a.every(x => x.full) ? 'Full Horseshoe' : a.every(x => x.qual) ? 'qualifies for next year' : 'not enough to qualify';
         const IL = (INTENSITY[plan.intensity] || INTENSITY.standard).label, nextUp = plan.intensity === 'conservative' ? 'Bring it On! or harder' : 'I am Death Incarnate!!';
         sec.appendChild(el('p', 'warn', `At ${IL}'s steady pace this plan reaches about ${bits.join(', ')} each by the end (${got}). That's short of ${goalText(plan)}. Reaching it takes ${nextUp}${/!$/.test(nextUp) ? '' : '.'}${got === 'not enough to qualify' && !goalsOf(plan).includes('qualify') ? ' At this push level, "Qualify for next year" is the realistic goal.' : ''}`));
       } else if (plan.unreachable) sec.appendChild(el('p', 'warn', `This plan can't reach ${goalText(plan)} for both climbers even at a very fast pace. Try a lower target, a harder push setting, or a higher division.`));
@@ -1576,7 +1614,7 @@
         sec.appendChild(pace);
       }
       const acts = el('div', 'btnrow');
-      const bMap = el('button', 'btn primary', 'Show on map'); bMap.type = 'button'; bMap.onclick = () => { ui.mapMode = 'plan'; const T = clockAbs(plan); if (T < plan.start || T > plan.start + FORMATS[plan.format].dur) { ui.date = plan.date; ui.hour = plan.start + 1; ctx.onClock(); } ctx.saveUi(); ctx.showTab('map'); };
+      const bMap = el('button', 'btn primary', 'Show on map'); bMap.type = 'button'; bMap.onclick = () => { ui.mapMode = 'plan'; const T = clockAbs(plan); if (T < plan.start || T > plan.start + FMT(plan).dur) { ui.date = plan.date; ui.hour = plan.start + 1; ctx.onClock(); } ctx.saveUi(); ctx.showTab('map'); };
       const firstOpen = plan.items.findIndex(i => !i.done);
       const bRe = el('button', 'btn', 'Re-plan the rest'); bRe.type = 'button'; bRe.title = 'Keeps checked-off routes and re-plans everything after them from now.';
       bRe.onclick = () => { optimize(plan, firstOpen < 0 ? plan.items.length : firstOpen); save(); render(); ctx.onPlanChange(); };
@@ -1639,7 +1677,7 @@
       let lineDrawn = doneAt == null, climbN = 0;
       for (const row of tl.rows) {
         if (!lineDrawn && row.t0 >= doneAt - 1e-6 && !(row.kind === 'route' && Math.abs(row.t1 - doneAt) < 1e-6)) {
-          lineDrawn = true; const end = plan.start + FORMATS[plan.format].dur;
+          lineDrawn = true; const end = plan.start + FMT(plan).dur;
           list.appendChild(el('li', 'p-goalline', `Goals met at ${fmtAbs(plan, doneAt, true)} · ${(end - doneAt).toFixed(1)} h buffer. Everything below is optional.`));
         }
         if (row.kind === 'walk') { list.appendChild(el('li', 'p-walk light-' + row.light, `${push(plan).walk >= 120 ? 'Jog' : 'Walk'} ${Math.max(1, Math.round((row.t1 - row.t0) * 60))} min to ${placeName(row.to)}`)); continue; }
@@ -1763,7 +1801,7 @@
       const q = el('input', 'search'); q.type = 'search'; q.placeholder = 'Search all routes'; q.style.margin = '0 16px 8px'; q.style.width = 'calc(100% - 32px)';
       d.appendChild(q);
       const ol = el('ol', 'routes compact picker'); d.appendChild(ol);
-      const rel = (tl.t - plan.start) / FORMATS[plan.format].dur;
+      const rel = (tl.t - plan.start) / FMT(plan).dur;
       const cl = Object.fromEntries(WHO.map(k => [k, climber(plan, k)]));
       const inPlan = Object.fromEntries(WHO.map(k => [k, new Set(plan.items.filter(it => it.rid && it.who && it.who.includes(k)).map(it => it.rid))]));
       const cands = comp().filter(r => (!wall || r.area === wall) && planFits(plan, r)).map(r => {
@@ -1850,7 +1888,7 @@
       }
       // expected position at the clock time
       const T = clockAbs(plan); let exp = null;
-      if (T >= plan.start && T <= plan.start + FORMATS[plan.format].dur) {
+      if (T >= plan.start && T <= plan.start + FMT(plan).dur) {
         for (let i = 0; i < stops.length; i++) {
           const s = stops[i], A1 = A[s.area];
           if (T >= s.arrive && T <= s.depart && A1?.lat != null) { exp = { lat: A1.lat, lon: A1.lon }; break; }
